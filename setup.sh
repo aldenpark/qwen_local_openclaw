@@ -29,7 +29,7 @@ cp /home/aldenpark/dev/qwen_local_openclaw/models/qwen-openclaw-optuna-tune.py "
 echo "=== Setup complete ==="
 echo ""
 echo "Next steps:"
-echo "1. Start qwen-local: cd $HOME/models && ./qwen-local.sh daemon"
+echo "1. Start qwen-local: cd $HOME/models && ./qwen-local.sh fast"
 echo "2. Start OpenClaw: openclaw gateway start"
 echo "3. Verify model is running: nc -zv 127.0.0.1 18080"
 

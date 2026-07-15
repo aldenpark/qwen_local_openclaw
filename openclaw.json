@@ -276,28 +276,9 @@
         ],
         "timeoutSeconds": 300,
         "localService": {
-          "env": {
-            "MODEL_PRESET": "qwen35-4b-q5km",
-            "MODEL_FILE": "Qwen3.5-4B-Q5_K_M.gguf",
-            "MODEL_DIR": "/home/aldenpark/models/qwen3.5-4b-q5km",
-            "MODEL": "/home/aldenpark/models/qwen3.5-4b-q5km/Qwen3.5-4B-Q5_K_M.gguf",
-            "HOST": "127.0.0.1",
-            "PORT": "18080",
-            "CTX": "153600",
-            "NGL": "999",
-            "PREDICT": "4096",
-            "PARALLEL": "1",
-            "BATCH": "256",
-            "UBATCH": "128",
-            "FLASH_ATTN": "auto",
-            "REASONING_BUDGET": "512",
-            "QWEN_MODEL_CATALOG": "/home/aldenpark/models/qwen-model-presets.json",
-            "MODEL_PORT": "18080",
-            "REASONING": "true"
-          },
           "command": "/home/aldenpark/models/qwen-local.sh",
           "args": [
-            "daemon"
+            "serve"
           ],
           "cwd": "/home/aldenpark/models"
         }

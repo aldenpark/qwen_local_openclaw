@@ -88,8 +88,36 @@ umask 077
 
 # --- Model presets -----------------------------------------------------------
 
-MODE="${1:-help}"
-CATALOG="${QWEN_MODEL_CATALOG:-$HOME/models/qwen-model-presets.json}"
+QWEN_LOCAL_ENV_FILE="${QWEN_LOCAL_ENV_FILE:-$HOME/.config/qwen-local/qwen-local.env}"
+
+validate_env_file() {
+  local line
+  local line_number=0
+
+  while IFS= read -r line || [ -n "$line" ]; do
+    line_number=$((line_number + 1))
+    case "$line" in
+      ""|\#*) continue ;;
+    esac
+    if [[ ! "$line" =~ ^[A-Za-z_][A-Za-z0-9_]*=[A-Za-z0-9_./:\$+@%,-]*$ ]]; then
+      echo "ERROR: invalid entry in $QWEN_LOCAL_ENV_FILE at line $line_number:" >&2
+      echo "  $line" >&2
+      exit 1
+    fi
+  done < "$QWEN_LOCAL_ENV_FILE"
+}
+
+if [ -f "$QWEN_LOCAL_ENV_FILE" ]; then
+  validate_env_file
+  set -a
+  # shellcheck source=/dev/null
+  . "$QWEN_LOCAL_ENV_FILE"
+  set +a
+fi
+
+MODE="${1:-${QWEN_LOCAL_MODE:-help}}"
+# CATALOG="${QWEN_MODEL_CATALOG:-$HOME/models/qwen-model-presets.json}"
+CATALOG="${QWEN_MODEL_CATALOG:-qwen-model-presets.json}"
 
 catalog_python() {
   python3 - "$@"
@@ -451,6 +479,9 @@ CTX="${CTX:-${DEFAULT_CTX:-32768}}"
 # NGL=999 asks llama.cpp to offload as many layers as possible to GPU/Metal.
 NGL="${NGL:-${DEFAULT_NGL:-999}}"
 REASONING_BUDGET="${REASONING_BUDGET:-512}"
+REASONING_FORMAT="${REASONING_FORMAT:-deepseek}"
+OUTPUT_MODE="${OUTPUT_MODE:-codex}"
+CUSTOM_CHAT_TEMPLATE="${CUSTOM_CHAT_TEMPLATE:-}"
 
 # -n, -np, -b, and -ub flags passed to llama-server.
 MAX_TOKENS="${MAX_TOKENS:-${DEFAULT_MAX_TOKENS:-4096}}"
@@ -458,18 +489,9 @@ PARALLEL="${PARALLEL:-${DEFAULT_PARALLEL:-1}}"
 BATCH="${BATCH:-${DEFAULT_BATCH:-256}}"
 UBATCH="${UBATCH:-${DEFAULT_UBATCH:-128}}"
 FLASH_ATTN="${FLASH_ATTN:-${DEFAULT_FLASH_ATTN:-auto}}"
-REASONING="${REASONING:-${DEFAULT_REASONING:-off}}"
+JINJA="${JINJA:-auto}"
 
-# Daemon bookkeeping. Keep the stable PID path outside world-writable /tmp;
-# write_pid_file uses mktemp and an atomic rename when the daemon starts.
-PID_FILE_IS_DEFAULT=0
-if [ -z "${PID_FILE:-}" ]; then
-  PID_FILE="${XDG_STATE_HOME:-$HOME/.local/state}/qwen-local/qwen-local-${PORT}.pid"
-  PID_FILE_IS_DEFAULT=1
-fi
-LOG_FILE="${LOG_FILE:-$HOME/llm-services/logs/qwen-local-${PORT}.log}"
 TUNE_TIMEOUT="${TUNE_TIMEOUT:-120}"
-OPENCLAW_QWEN_MODE="${OPENCLAW_QWEN_MODE:-daemon}"
 MODEL_ID="$(basename "$MODEL")"
 OPENCLAW_MODEL_REF="qwen-local/${MODEL_ID}"
 
@@ -838,64 +860,10 @@ check_vram() {
   fi
 }
 
-write_pid_file() {
-  local pid="$1"
-  local pid_dir
-  local pid_tmp
-
-  pid_dir="$(dirname "$PID_FILE")"
-  mkdir -p "$pid_dir"
-  if [ "$PID_FILE_IS_DEFAULT" -eq 1 ]; then
-    chmod 700 "$pid_dir"
-  fi
-  pid_tmp="$(mktemp "${PID_FILE}.XXXXXX")"
-  printf '%s\n' "$pid" > "$pid_tmp"
-  mv -f "$pid_tmp" "$PID_FILE"
-}
-
-DAEMON_PID=""
-DAEMON_PID_FILE=""
-
-cleanup_owned_daemon() {
-  local status=$?
-  local recorded_pid=""
-
-  trap - EXIT INT TERM HUP
-  if [ -n "$DAEMON_PID" ] && kill -0 "$DAEMON_PID" 2>/dev/null; then
-    kill "$DAEMON_PID" 2>/dev/null || true
-    sleep 1
-    if kill -0 "$DAEMON_PID" 2>/dev/null; then
-      kill -9 "$DAEMON_PID" 2>/dev/null || true
-    fi
-  fi
-
-  if [ -n "$DAEMON_PID_FILE" ] && [ -f "$DAEMON_PID_FILE" ]; then
-    recorded_pid="$(cat "$DAEMON_PID_FILE" 2>/dev/null || true)"
-    [ "$recorded_pid" = "$DAEMON_PID" ] && rm -f "$DAEMON_PID_FILE"
-  fi
-
-  return "$status"
-}
-
-arm_daemon_cleanup() {
-  DAEMON_PID="$1"
-  DAEMON_PID_FILE="$PID_FILE"
-  trap cleanup_owned_daemon EXIT
-  trap 'exit 130' INT
-  trap 'exit 143' TERM
-  trap 'exit 129' HUP
-}
-
-disarm_daemon_cleanup() {
-  trap - EXIT INT TERM HUP
-  DAEMON_PID=""
-  DAEMON_PID_FILE=""
-}
-
 kill_port() {
   # Keep startup deterministic by clearing anything already bound to this port.
   if command -v fuser >/dev/null 2>&1; then
-    fuser -k "${PORT}/tcp" 2>/dev/null || true
+    fuser -k "${PORT}/tcp" >/dev/null 2>&1 || true
   elif command -v lsof >/dev/null 2>&1; then
     lsof -tiTCP:"$PORT" -sTCP:LISTEN 2>/dev/null \
       | while IFS= read -r pid; do
@@ -924,16 +892,61 @@ show_port_status() {
 start_server() {
   local reasoning="$1"
   local args=()
+  local chat_template_file=""
+  local script_dir
+
+  script_dir="$(cd "$(dirname "$0")" && pwd)"
 
   if [ "$reasoning" = "on" ]; then
     args=(--reasoning on --reasoning-budget "$REASONING_BUDGET")
   else
     args=(--reasoning off)
   fi
+  case "$JINJA" in
+    auto) ;;
+    on) args+=(--jinja) ;;
+    off) args+=(--no-jinja) ;;
+    *)
+      echo "ERROR: JINJA must be 'auto', 'on', or 'off'." >&2
+      exit 1
+      ;;
+  esac
+
+  case "$OUTPUT_MODE" in
+    codex)
+      chat_template_file="$script_dir/templates/qwen3.5-codex.jinja"
+      ;;
+    native)
+      ;;
+    custom)
+      [ -n "$CUSTOM_CHAT_TEMPLATE" ] || {
+        echo "ERROR: CUSTOM_CHAT_TEMPLATE is required when OUTPUT_MODE=custom." >&2
+        exit 1
+      }
+      case "$CUSTOM_CHAT_TEMPLATE" in
+        /*) chat_template_file="$CUSTOM_CHAT_TEMPLATE" ;;
+        *) chat_template_file="$script_dir/$CUSTOM_CHAT_TEMPLATE" ;;
+      esac
+      ;;
+    *)
+      echo "ERROR: OUTPUT_MODE must be 'codex', 'native', or 'custom'." >&2
+      exit 1
+      ;;
+  esac
+
+  if [ -n "$chat_template_file" ]; then
+    [ -f "$chat_template_file" ] || {
+      echo "ERROR: chat template not found: $chat_template_file" >&2
+      exit 1
+    }
+    args+=(--chat-template-file "$chat_template_file")
+  fi
+  # The chat template sets its own default, so this override must come last.
+  args+=(--reasoning-format "$REASONING_FORMAT")
 
   require_runtime_files
-  check_vram
   kill_port
+  check_vram
 
   local log_dir="$HOME/llm-services/logs"
   mkdir -p "$log_dir"
@@ -951,6 +964,9 @@ start_server() {
   echo "  UBATCH=$UBATCH"
   echo "  FLASH_ATTN=$FLASH_ATTN"
   echo "  REASONING=$reasoning"
+  echo "  REASONING_FORMAT=$REASONING_FORMAT"
+  echo "  OUTPUT_MODE=$OUTPUT_MODE"
+  echo "  CHAT_TEMPLATE=${chat_template_file:-model-native}"
   echo "  LOG=$log_file"
 
   "$SERVER" \
@@ -968,127 +984,13 @@ start_server() {
     2>&1 | tee "$log_file"
 }
 
-start_daemon() {
-  local reasoning="$1"
-  local args=()
-
-  require_runtime_files
-
-  # PID files only guard daemon mode. Foreground starts still clear by port.
-  if [ -f "$PID_FILE" ]; then
-    local old_pid
-    old_pid="$(cat "$PID_FILE" 2>/dev/null || true)"
-    if [ -n "$old_pid" ] && kill -0 "$old_pid" 2>/dev/null; then
-      echo "Server already running. PID: $old_pid"
-      echo "Stop with: $0 stop"
-      exit 1
-    fi
-    # Stale PID file - try to remove it
-    rm -f "$PID_FILE"
-    # Double-check after removal
-    if [ -f "$PID_FILE" ]; then
-      local stale_pid
-      stale_pid="$(cat "$PID_FILE" 2>/dev/null || true)"
-      if [ -n "$stale_pid" ] && ! kill -0 "$stale_pid" 2>/dev/null; then
-        echo "Removing stale PID file"
-        rm -f "$PID_FILE"
-      fi
-    fi
-  fi
-
-  if [ "$reasoning" = "on" ]; then
-    args=(--reasoning on --reasoning-budget "$REASONING_BUDGET")
-  else
-    args=(--reasoning off)
-  fi
-
-  check_vram
-  kill_port
-  mkdir -p "$(dirname "$LOG_FILE")"
-
-  # Use nohup so the server survives the shell that launched it.
-  echo "Starting qwen server in background..."
-  nohup "$SERVER" \
-    -m "$MODEL" \
-    --host "$HOST" \
-    --port "$PORT" \
-    -ngl "$NGL" \
-    -c "$CTX" \
-    -n "$MAX_TOKENS" \
-    -np "$PARALLEL" \
-    -b "$BATCH" \
-    -ub "$UBATCH" \
-    --flash-attn "$FLASH_ATTN" \
-    "${args[@]}" \
-    >> "$LOG_FILE" 2>&1 &
-
-  local pid=$!
-  arm_daemon_cleanup "$pid"
-  write_pid_file "$pid"
-
-  # Wait until the OpenAI-compatible model endpoint responds before returning.
-  echo "Waiting for server to become ready..."
-  local attempt=0
-  local max_attempts=2
-  local delay=1
-
-  while [ "$attempt" -lt "$max_attempts" ]; do
-    sleep "$delay"
-    attempt=$((attempt + 1))
-    if curl -fsS "http://${HOST}:${PORT}/v1/models" >/dev/null 2>&1; then
-      echo "Server started. PID: $pid"
-      echo "Log: $LOG_FILE"
-      disarm_daemon_cleanup
-      return 0
-    fi
-
-    if ! kill -0 "$pid" 2>/dev/null; then
-      echo "ERROR: server exited during startup."
-      tail -n 40 "$LOG_FILE" || true
-      exit 1
-    fi
-
-    delay=2
-  done
-
-  echo "ERROR: server did not become ready after $max_attempts attempts (3 seconds)."
-  tail -n 40 "$LOG_FILE" || true
-  exit 1
-}
-
 stop_server() {
-  # Prefer the daemon PID when present, then clear the port as a fallback.
-  if [ -f "$PID_FILE" ]; then
-    local pid
-    pid="$(cat "$PID_FILE" 2>/dev/null || true)"
-    if [ -n "$pid" ]; then
-      kill "$pid" 2>/dev/null || true
-      for _ in {1..10}; do
-        kill -0 "$pid" 2>/dev/null || break
-        sleep 1
-      done
-      kill -9 "$pid" 2>/dev/null || true
-    fi
-    rm -f "$PID_FILE"
-  fi
-
   kill_port
   echo "Stopped/cleared port $PORT"
 }
 
 status_server() {
   echo "Configured endpoint: http://${HOST}:${PORT}"
-  echo "PID file: $PID_FILE"
-  if [ -f "$PID_FILE" ]; then
-    local pid
-    pid="$(cat "$PID_FILE" 2>/dev/null || true)"
-    if [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null; then
-      echo "PID running: $pid"
-    else
-      echo "PID file exists but process is not running"
-    fi
-  fi
-
   show_port_status || echo "qwen server is not running on port $PORT"
 }
 
@@ -1131,6 +1033,104 @@ test_server() {
   echo "Server responding OK"
   echo "$response"
   return 0
+}
+
+test_codex_responses() {
+  local tmp_dir
+  local http_status
+
+  tmp_dir="$(mktemp -d "${TMPDIR:-/tmp}/qwen-codex-test.XXXXXX")"
+  if ! http_status=$(curl -sS -o "$tmp_dir/response" -w '%{http_code}' \
+    "http://${HOST}:${PORT}/v1/responses" \
+    -H "Content-Type: application/json" \
+    -d "{
+      \"model\": \"${MODEL_ID}\",
+      \"input\": \"Say only: qwen works\"
+    }" 2>"$tmp_dir/error"); then
+    echo "ERROR: Codex compatibility check could not reach the server." >&2
+    [ -s "$tmp_dir/error" ] && cat "$tmp_dir/error" >&2
+    rm -rf "$tmp_dir"
+    return 1
+  fi
+
+  case "$http_status" in
+    2??)
+      rm -rf "$tmp_dir"
+      return 0
+      ;;
+    *)
+      echo "Codex requires /v1/responses, but llama-server returned HTTP $http_status." >&2
+      [ -s "$tmp_dir/response" ] && cat "$tmp_dir/response" >&2
+      rm -rf "$tmp_dir"
+      return 1
+      ;;
+  esac
+}
+
+write_codex_profile() {
+  local profile_name="${CODEX_PROFILE:-local-llama}"
+  local codex_home="${CODEX_HOME:-$HOME/.codex}"
+  local profile_path="$codex_home/${profile_name}.config.toml"
+  local catalog_dir="$codex_home/model-catalogs"
+  local catalog_path="$catalog_dir/${profile_name}.json"
+
+  test_codex_responses || {
+    echo "No Codex profile was written. Put a Responses-compatible proxy in front of llama-server, then retry." >&2
+    return 1
+  }
+
+  mkdir -p "$codex_home" "$catalog_dir"
+  cat > "$catalog_path" <<EOF
+{
+  "models": [
+    {
+      "slug": $(json_string "$MODEL_ID"),
+      "display_name": $(json_string "$MODEL_ID"),
+      "description": "Local llama.cpp model",
+      "default_reasoning_level": "medium",
+      "supported_reasoning_levels": [
+        {"effort": "medium", "description": "Use the local model reasoning configuration"}
+      ],
+      "shell_type": "shell_command",
+      "visibility": "list",
+      "supported_in_api": true,
+      "priority": 1,
+      "base_instructions": "You are Codex, a coding agent. Follow the developer and user instructions, use tools when needed, edit files directly, and verify your work.",
+      "supports_reasoning_summaries": false,
+      "support_verbosity": false,
+      "apply_patch_tool_type": "freeform",
+      "truncation_policy": {"mode": "tokens", "limit": 10000},
+      "supports_parallel_tool_calls": false,
+      "context_window": $CTX,
+      "max_context_window": $CTX,
+      "effective_context_window_percent": 95,
+      "experimental_supported_tools": [],
+      "input_modalities": ["text"],
+      "supports_search_tool": false,
+      "use_responses_lite": false
+    }
+  ]
+}
+EOF
+
+  cat > "$profile_path" <<EOF
+# Generated by $(basename "$0") for the current llama.cpp server.
+model = "${MODEL_ID}"
+model_provider = "qwen-local-profile"
+model_context_window = ${CTX}
+model_catalog_json = "${catalog_path}"
+
+[model_providers.qwen-local-profile]
+name = "Local llama.cpp"
+base_url = "http://${HOST}:${PORT}/v1"
+wire_api = "responses"
+stream_idle_timeout_ms = 600000
+request_max_retries = 1
+EOF
+
+  echo "Wrote Codex profile: $profile_path"
+  echo "Wrote Codex model catalog: $catalog_path"
+  echo "Start Codex with: codex --profile $profile_name"
 }
 
 print_cline() {
@@ -1247,7 +1247,7 @@ openclaw_provider_json() {
   script_path="$(canonical_path "$0")"
 
   cat <<EOF
-{"baseUrl":$(json_string "http://${HOST}:${PORT}/v1"),"apiKey":"local","api":"openai-completions","timeoutSeconds":300,"localService":{"command":$(json_string "$script_path"),"args":[$(json_string "$OPENCLAW_QWEN_MODE")],"cwd":$(json_string "$(dirname "$script_path")"),"env":{"MODEL_PRESET":$(json_string "$MODEL_PRESET"),"QWEN_MODEL_CATALOG":$(json_string "$CATALOG"),"MODEL_REPO":$(json_string "$MODEL_REPO"),"MODEL_FILE":$(json_string "$MODEL_FILE"),"MODEL_DIR":$(json_string "$MODEL_DIR"),"MODEL":$(json_string "$MODEL"),"HOST":$(json_string "$HOST"),"PORT":$(json_string "$PORT"),"CTX":$(json_string "$CTX"),"NGL":$(json_string "$NGL"),"PARALLEL":$(json_string "$PARALLEL"),"BATCH":$(json_string "$BATCH"),"UBATCH":$(json_string "$UBATCH"),"FLASH_ATTN":$(json_string "$FLASH_ATTN"),"REASONING_BUDGET":$(json_string "$REASONING_BUDGET"),"REASONING":$(json_string "$REASONING"),"LLAMA_BACKEND":$(json_string "${LLAMA_BACKEND:-auto}")},"healthUrl":$(json_string "http://${HOST}:${PORT}/v1/models"),"readyTimeoutMs":180000,"idleStopMs":0},"models":[{"id":$(json_string "$MODEL_ID"),"name":$(json_string "$MODEL_PRESET local llama.cpp"),"reasoning":true,"input":["text"],"cost":{"input":0,"output":0,"cacheRead":0,"cacheWrite":0},"contextWindow":$CTX,"maxTokens":$MAX_TOKENS}]}
+{"baseUrl":$(json_string "http://${HOST}:${PORT}/v1"),"apiKey":"local","api":"openai-completions","timeoutSeconds":300,"localService":{"command":$(json_string "$script_path"),"args":["fast"],"cwd":$(json_string "$(dirname "$script_path")"),"healthUrl":$(json_string "http://${HOST}:${PORT}/v1/models"),"readyTimeoutMs":180000,"idleStopMs":0},"models":[{"id":$(json_string "$MODEL_ID"),"name":$(json_string "$MODEL_PRESET local llama.cpp"),"reasoning":true,"input":["text"],"cost":{"input":0,"output":0,"cacheRead":0,"cacheWrite":0},"contextWindow":$CTX,"maxTokens":$MAX_TOKENS}]}
 EOF
 }
 
@@ -1297,7 +1297,7 @@ print_openclaw_review() {
   echo "  Catalog:     $CATALOG"
   echo "  Base URL:    http://${HOST}:${PORT}/v1"
   echo "  Health URL:  http://${HOST}:${PORT}/v1/models"
-  echo "  Start mode:  $OPENCLAW_QWEN_MODE"
+  echo "  Runtime config: $QWEN_LOCAL_ENV_FILE"
   echo "  Model file:  $MODEL"
   echo "  CTX:         $CTX"
   echo "  MAX_TOKENS:     $MAX_TOKENS"
@@ -1765,7 +1765,7 @@ tune_openclaw_settings() {
     --host "${TUNE_HOST:-127.0.0.1}" \
     --port "$PORT" \
     --openclaw-config "${OPENCLAW_CONFIG:-$HOME/.openclaw/openclaw.json}" \
-    --env-file "${OPENCLAW_ENV_FILE:-$HOME/.config/qwen-local/openclaw.env}"
+    --env-file "${QWEN_LOCAL_ENV_FILE:-$HOME/.config/qwen-local/qwen-local.env}"
 }
 
 # --- Command dispatch -------------------------------------------------------
@@ -1783,12 +1783,6 @@ case "$MODE" in
   reasoning)
     start_server on
     ;;
-  daemon)
-    start_daemon off
-    ;;
-  daemon-reasoning)
-    start_daemon on
-    ;;
   stop)
     stop_server
     ;;
@@ -1797,6 +1791,9 @@ case "$MODE" in
     ;;
   test)
     test_server
+    ;;
+  codex-profile)
+    write_codex_profile
     ;;
   cline)
     print_cline
@@ -1820,7 +1817,7 @@ case "$MODE" in
     print_openclaw_review
     ;;
   *)
-    echo "Usage: $0 {install|update|fast|reasoning|daemon|daemon-reasoning|stop|status|test|cline|vscode|tune|diagnose-openclaw|tune-openclaw|openclaw-install|openclaw-review}"
+    echo "Usage: $0 {install|update|fast|reasoning|stop|status|test|codex-profile|cline|vscode|tune|diagnose-openclaw|tune-openclaw|openclaw-install|openclaw-review}"
     echo
     echo "Install/update:"
     echo "  $0 install                 Choose model, install deps, build llama.cpp, download model"
@@ -1829,13 +1826,12 @@ case "$MODE" in
     echo "Start:"
     echo "  $0 fast                    Start server in foreground, reasoning off"
     echo "  $0 reasoning               Start server in foreground, reasoning on"
-    echo "  $0 daemon                  Start server in background, reasoning off"
-    echo "  $0 daemon-reasoning        Start server in background, reasoning on"
     echo
     echo "Manage/test:"
     echo "  $0 stop                    Stop server on configured port"
     echo "  $0 status                  Show server status"
     echo "  $0 test                    Send simple chat request"
+    echo "  $0 codex-profile           Write a Codex profile when /v1/responses is supported"
     echo
     echo "Config:"
     echo "  $0 cline                   Print Cline config"
@@ -1848,8 +1844,10 @@ case "$MODE" in
     echo
     echo "Environment overrides:"
     echo "  QWEN_MODEL_CATALOG MODEL_PRESET MODEL_REPO MODEL_FILE MODEL_DIR MODEL MODEL_SHA256"
-    echo "  LLAMA_BACKEND LLAMA_DIR LLAMA_CPP_REF LLAMA_CPP_COMMIT SERVER CLI OPENCLAW_QWEN_MODE"
-    echo "  HOST PORT CTX NGL REASONING_BUDGET MAX_TOKENS PARALLEL BATCH UBATCH FLASH_ATTN"
-    echo "  PID_FILE LOG_FILE TUNE_TIMEOUT"
+    echo "  QWEN_LOCAL_ENV_FILE QWEN_LOCAL_MODE"
+    echo "  LLAMA_BACKEND LLAMA_DIR LLAMA_CPP_REF LLAMA_CPP_COMMIT SERVER CLI"
+    echo "  HOST PORT CTX NGL REASONING_BUDGET REASONING_FORMAT MAX_TOKENS PARALLEL BATCH UBATCH FLASH_ATTN"
+    echo "  OUTPUT_MODE CUSTOM_CHAT_TEMPLATE"
+    echo "  TUNE_TIMEOUT CODEX_HOME CODEX_PROFILE"
     ;;
 esac
